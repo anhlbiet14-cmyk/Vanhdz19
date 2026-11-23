@@ -520,7 +520,7 @@ local SwordData = {
     { id = "Yama",                label = "Yama (Sea 3 - 30 Elite + Đền Hydra)",    sea = 3, pos = Vector3.new(5225, 6, -1115) },
     { id = "Tushita",             label = "Tushita (Sea 3 - Đuốc & Boss Longma)",   sea = 3, boss = "Longma",               pos = Vector3.new(-10218, 332, -9444) },
     { id = "Cursed Dual Katana",  label = "Cursed Dual Katana (CDK - Sea 3)",        sea = 3, pos = Vector3.new(-12361, 603, -6550) },
-    { id = "Cavander",            label = "Cavander (Sea 3 - Beautiful Pirate)",     sea = 3, boss = "Beautiful Pirate",     pos = Vector3.new(5370, 22, -89) },
+    { id = "Canvander",            label = "Canvander (Sea 3 - Beautiful Pirate)",     sea = 3, boss = "Beautiful Pirate",     pos = Vector3.new(5370, 22, -89) },
     { id = "Twin Hooks",          label = "Twin Hooks (Sea 3 - Captain Elephant)",   sea = 3, boss = "Captain Elephant",     pos = Vector3.new(-13393, 319, -8423) },
     { id = "Buddy Sword",         label = "Buddy Sword (Sea 3 - Cake Queen)",        sea = 3, boss = "Cake Queen",           pos = Vector3.new(-710, 382, -11010) },
     { id = "Hallow Scythe",       label = "Hallow Scythe (Sea 3 - Soul Reaper)",     sea = 3, boss = "Soul Reaper",          pos = Vector3.new(-9524, 315, 6655) },
@@ -2354,6 +2354,7 @@ local function getStyleSpec(id)
 end
 
 local function getSwordSpec(id)
+    if id == "Cavander" then id = "Canvander" end -- tên cũ bị gõ sai, giữ tương thích cấu hình đã lưu
     for _, s in ipairs(SwordData) do
         if s.id == id then return s end
     end
@@ -2373,15 +2374,34 @@ local SW = {
     lastInv = -1e9, inv = nil,
     lastElite = -1e9, eliteN = nil,
     lastTouch = -1e9, ignoreRSUntil = 0,
+    fbCache = {},
+    tIdx = 1, tReach = nil, tForceUntil = 0,
+    tFight = { mob = nil, hp = 0, since = 0 },
+    lastEliteCall = -1e9, lastPull = -1e9,
     hop = nil, -- gán sau khi serverHop được định nghĩa
 }
 
+-- Tushita: cổng sáng ở Hydra -> Floating Turtle (nhận Holy Torch, 5 phút), thắp 5 đuốc ĐÚNG THỨ TỰ, rồi mới tới phòng Longma
+SW.TUSHITA = {
+    gate = Vector3.new(5148.04, 162.35, 910.55),
+    arena = Vector3.new(-10238.9, 389.8, -9549.8),
+    torches = {
+        Vector3.new(-10752, 417, -9366),
+        Vector3.new(-11672, 334, -9474),
+        Vector3.new(-12132, 521, -10655),
+        Vector3.new(-13336, 486, -6985),
+        Vector3.new(-13489, 332, -7925),
+    },
+}
+-- NPC Elite Hunter (Castle on the Sea): phải tới đây mới nhận được nhiệm vụ Elite
+SW.ELITE_NPC = Vector3.new(-5418.9, 313.7, -2826.2)
+
 SW.hints = {
     ["Saber"] = "Saber cần giải đố (đuốc / cốc / Sick Man / Rich Son) rồi Saber Expert mới xuất hiện. Bước giải đố có thể phải làm tay.",
-    ["Tushita"] = "Tushita cần làm bước Holy Torch để Longma xuất hiện. Bước này có thể phải làm tay.",
+    ["Tushita"] = "Tushita cần: rip_indra còn sống (God's Chalice + 3 màu Haki huyền thoại), vào cổng sáng ở Hydra, thắp 5 đuốc trong 5 phút rồi đánh Longma.",
     ["Cursed Dual Katana"] = "CDK cần Yama + Tushita và các Trial Good/Evil. Các bước Trial có thể phải làm tay.",
     ["Fox Lamp"] = "Fox Lamp cần Đảo Cáo (Kitsune) xuất hiện trên biển. Chưa có đảo thì phải chờ hoặc đổi server.",
-    ["Dark Dagger"] = "rip_indra True Form cần được triệu hồi trước. Chưa có Boss thì chưa làm tiếp được.",
+    ["Dark Dagger"] = "Cần God's Chalice đặt lên bệ ở Castle on the Sea để gọi rip_indra True Form. Chưa có Boss thì chưa làm tiếp được.",
 }
 
 function SW.setMode(id, mode)
@@ -2447,23 +2467,39 @@ function SW.eliteProgress()
     return SW.eliteN
 end
 
--- Tìm Boss/Elite đã spawn, kể cả khi còn nằm trong ReplicatedStorage (chưa load vào Enemies)
+-- Tìm Boss/Elite đã spawn, kể cả khi còn nằm trong ReplicatedStorage (chưa load vào Enemies).
+-- Chấp nhận tên có hậu tố cấp độ, ví dụ "Diablo [Lv. 1750]".
 function SW.findBossAnywhere(names)
-    local enemies = workspace:FindFirstChild("Enemies")
-    for _, folder in ipairs({ enemies, Svc.ReplicatedStorage }) do
-        if folder then
-            for _, nm in ipairs(names) do
-                local m = folder:FindFirstChild(nm)
-                if m then
-                    local hum = m:FindFirstChildOfClass("Humanoid")
-                    local hrp = m:FindFirstChild("HumanoidRootPart")
-                    if hum and hrp and hum.Health > 0 and hrp.Position.Y > -50 and hrp.Position.Magnitude > 1 then
-                        return m, hrp.Position
+    local ck = table.concat(names, "|")
+    local now = os.clock()
+    local c = SW.fbCache[ck]
+    if not (c and now - c.t < 0.3) then
+        c = { t = now, m = nil }
+        SW.fbCache[ck] = c
+        local enemies = workspace:FindFirstChild("Enemies")
+        for _, folder in ipairs({ enemies, Svc.ReplicatedStorage }) do
+            if folder and not c.m then
+                for _, child in ipairs(folder:GetChildren()) do
+                    local nm = child.Name
+                    for _, want in ipairs(names) do
+                        local p = nm:sub(1, #want + 2)
+                        if nm == want or p == want .. " [" or p == want .. " (" then
+                            local hum = child:FindFirstChildOfClass("Humanoid")
+                            local hrp = child:FindFirstChild("HumanoidRootPart")
+                            if hum and hrp and hum.Health > 0 and hrp.Position.Y > -50 and hrp.Position.Magnitude > 1 then
+                                c.m = child
+                            end
+                            break
+                        end
                     end
+                    if c.m then break end
                 end
             end
         end
     end
+    local m = c.m
+    local hrp = m and m.Parent and m:FindFirstChild("HumanoidRootPart")
+    if hrp then return m, hrp.Position end
     return nil, nil
 end
 
@@ -2568,12 +2604,193 @@ function SW.ensureSea(sw)
     return false
 end
 
+-- =====================================================
+--  TUSHITA: vào cổng Hydra -> thắp 5 đuốc theo thứ tự -> đánh Longma
+--  (Longma KHÔNG mất máu nếu chưa thắp đủ đuốc, nên không được lao vào đánh sớm)
+-- =====================================================
+function SW.tushita(root, dt, sw)
+    local C = SW.TUSHITA
+    local now = os.clock()
+    local char = LP.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+
+    -- 1. Đang cầm Holy Torch (đã vào đố): thắp lần lượt 5 đuốc
+    if hasToolInInventory("Holy Torch") then
+        if SW.mode ~= "torch" then
+            SW.tIdx = 1
+            SW.tReach = nil
+        end
+        SW.setMode(sw.id, "torch")
+        State.target = nil
+        State.holdUntil = now + 1 -- tạm dừng vòng lặp đánh để nó không đổi tay cầm khỏi Holy Torch
+        if hum then
+            local held = char:FindFirstChildOfClass("Tool")
+            if not (held and held.Name:find("Holy Torch", 1, true)) then
+                local t = LP.Backpack:FindFirstChild("Holy Torch")
+                if t then pcall(function() hum:EquipTool(t) end) end
+            end
+        end
+        local target = C.torches[SW.tIdx]
+        State.statusText = ("Tushita: thắp đuốc %d/%d"):format(SW.tIdx, #C.torches)
+        moveTowards(root, target, target, dt)
+        if (root.Position - target).Magnitude <= 10 then
+            SW.tReach = SW.tReach or now
+            if now - SW.tReach >= 0.8 then
+                SW.tIdx = SW.tIdx + 1
+                SW.tReach = nil
+                if SW.tIdx > #C.torches then SW.tIdx = 1 end -- còn Holy Torch nghĩa là chưa đủ: đi lại từ đầu
+            end
+        else
+            SW.tReach = nil
+        end
+        return true
+    end
+
+    -- 2. Cổng phòng Longma đã mở (Map.Turtle không còn TushitaGate): đánh Longma
+    local map = workspace:FindFirstChild("Map")
+    local turtle = map and map:FindFirstChild("Turtle")
+    local puzzleDone = turtle ~= nil and turtle:FindFirstChild("TushitaGate") == nil
+    if puzzleDone and now >= SW.tForceUntil then
+        local mob = findMobFromList({ "Longma" }, root, math.huge)
+        if isAlive(mob) then
+            SW.setMode(sw.id, "longma")
+            -- Longma không mất máu 25 giây = đố chưa xong thật: quay lại cổng Hydra
+            local mh = mob:FindFirstChildOfClass("Humanoid")
+            local f = SW.tFight
+            if mh then
+                if f.mob ~= mob or mh.Health < f.hp - 1 then
+                    f.mob, f.hp, f.since = mob, mh.Health, now
+                end
+                if now - f.since > 25 then
+                    SW.tForceUntil = now + 90
+                    f.mob = nil
+                    notify("Tushita", "Longma không mất máu - đố đuốc chưa xong. Quay lại cổng Hydra.", 6, T.bad, true)
+                    return true
+                end
+            end
+            SW.fight(root, dt, mob, "Tushita: Diệt Longma", false)
+            return true
+        end
+        if SW.flyToSpawned(root, dt, { "Longma" }, sw.id, "Tushita: Longma đã xuất hiện - đang bay tới") then
+            return true
+        end
+        SW.setMode(sw.id, "longma_wait")
+        State.target = nil
+        State.statusText = "Tushita: chờ Longma xuất hiện..."
+        moveTowards(root, C.arena, C.arena, dt)
+        return true
+    end
+
+    -- 3. Chưa có đuốc: vào cổng sáng ở Hydra (cần rip_indra còn sống) để sang Floating Turtle và nhận Holy Torch
+    SW.setMode(sw.id, "gate")
+    State.target = nil
+    local indra = SW.findBossAnywhere({ "rip_indra True Form", "rip_indra" })
+    if indra then
+        State.statusText = "Tushita: vào cổng Hydra để nhận Holy Torch"
+    else
+        State.statusText = "Tushita: cần rip_indra còn sống (God's Chalice)"
+    end
+    moveTowards(root, C.gate, C.gate, dt)
+    if SW.idleFor() > 25 then
+        if indra then
+            SW.warn("Tushita", "Đã tới cổng Hydra nhưng chưa vào được. Kiểm tra Level >= 2000 và rip_indra còn sống.", 45)
+        else
+            SW.warn("Tushita", SW.hints["Tushita"], 60)
+        end
+    end
+    return true
+end
+
+-- =====================================================
+--  YAMA: nhận nhiệm vụ Elite ở NPC (Castle on the Sea) -> diệt Elite -> đủ 30 thì rút kiếm ở đền Hydra
+-- =====================================================
+function SW.yama(root, dt, sw)
+    local now = os.clock()
+    local prog = SW.eliteProgress()
+    local ptxt = (prog and tostring(prog) or "?") .. "/30"
+
+    -- Đủ 30 Elite: rút kiếm (chưa đủ mà rút là chết)
+    if prog and prog >= 30 then
+        local map = workspace:FindFirstChild("Map")
+        local wf = map and map:FindFirstChild("Waterfall")
+        local sealed = wf and wf:FindFirstChild("SealedKatana")
+        local handle = sealed and sealed:FindFirstChild("Handle")
+        if handle then
+            SW.setMode(sw.id, "pull")
+            State.target = nil
+            State.statusText = "Yama: Đang rút kiếm (" .. ptxt .. ")"
+            local hp = handle.Position
+            local ghost = findMobByName("Ghost", root, 200)
+            if isAlive(ghost) then
+                SW.fight(root, dt, ghost, "Yama: Dọn Ghost", true)
+                return true
+            end
+            moveTowards(root, hp + Vector3.new(0, 3, 0), hp, dt)
+            if (root.Position - hp).Magnitude < 25 and now - SW.lastPull > 0.15 then
+                SW.lastPull = now
+                local cd = handle:FindFirstChildOfClass("ClickDetector")
+                if cd and fireclickdetector then pcall(fireclickdetector, cd, 0.1) end
+            end
+            if SW.idleFor() > 60 then
+                SW.warn("Yama", "Đã tới thanh kiếm nhưng chưa rút được. Hãy thử rút bằng tay.", 60)
+            end
+            return true
+        end
+        -- Không thấy SealedKatana: cách cũ
+        SW.setMode(sw.id, "pull_old")
+        State.target = nil
+        State.statusText = "Yama: Đang rút kiếm tại Đền Hydra (" .. ptxt .. ")"
+        moveTowards(root, sw.pos, sw.pos, dt)
+        local waterfall = wf
+        if waterfall and now - SW.lastPull > 0.3 then
+            SW.lastPull = now
+            for _, desc in ipairs(waterfall:GetDescendants()) do
+                if desc:IsA("ClickDetector") then pcall(fireclickdetector, desc, 0.1) end
+            end
+        end
+        return true
+    end
+
+    -- Chưa đủ 30: săn Elite
+    local eliteNames = { "Diablo", "Urban", "Deandre" }
+    local elite = findMobFromList(eliteNames, root, math.huge)
+    if isAlive(elite) then
+        SW.setMode(sw.id, "elite")
+        SW.fight(root, dt, elite, ("Yama (%s): Săn Elite %s"):format(ptxt, elite.Name), false)
+        return true
+    end
+    if SW.flyToSpawned(root, dt, eliteNames, sw.id, ("Yama (%s): Elite đã spawn - đang bay tới"):format(ptxt)) then
+        return true
+    end
+
+    -- Chưa có Elite: phải đứng ở NPC Elite Hunter mới nhận được nhiệm vụ
+    SW.setMode(sw.id, "elite_quest")
+    State.target = nil
+    local npc = SW.ELITE_NPC
+    moveTowards(root, npc, npc, dt)
+    local questActive = hasBossOrSpecialQuest("Diablo") or hasBossOrSpecialQuest("Urban") or hasBossOrSpecialQuest("Deandre")
+    if questActive then
+        State.statusText = ("Yama (%s): đã nhận nhiệm vụ, chờ Elite xuất hiện..."):format(ptxt)
+    else
+        State.statusText = ("Yama (%s): nhận nhiệm vụ Elite Hunter ở NPC"):format(ptxt)
+        if (root.Position - npc).Magnitude <= 15 and now - SW.lastEliteCall > 1.3 then
+            SW.lastEliteCall = now
+            task.spawn(invokeCommF, "EliteHunter")
+        end
+    end
+    if SW.idleFor() > 90 then
+        SW.warn("Yama", "Elite chưa xuất hiện (" .. ptxt .. "). Nhiệm vụ Elite có thời gian chờ, hãy đợi hoặc bật 'Tự đổi server'.", 60)
+    end
+    SW.maybeHop("Elite không spawn")
+    return true
+end
+
 function SW.step(root, dt)
     local sw = getSwordSpec(config.selectedSword)
     if not sw then return end
 
     -- 0. Đã có kiếm -> xong
-    if hasToolInInventory(sw.id) then
+    if hasToolInInventory(sw.id) or (sw.id == "Canvander" and hasToolInInventory("Cavander")) then
         setToggle("autoGetSword", false)
         notify("Lấy Kiếm Thành Công!", "Bạn đã sở hữu: " .. sw.id, 5, T.good, true)
         State.target = nil
@@ -2584,11 +2801,16 @@ function SW.step(root, dt)
     -- 1. Đúng Sea chưa?
     if not SW.ensureSea(sw) then return end
 
+    -- 2a. Tushita có đố đuốc riêng (lao vào đánh Longma khi chưa thắp đuốc thì Longma KHÔNG mất máu)
+    if sw.id == "Tushita" then
+        if SW.tushita(root, dt, sw) then return end
+    end
+
     -- 2. Boss rơi kiếm
     local bossNames = nil
     if sw.id == "Spikey Trident" then
         bossNames = { "Dough King", "Cake Prince" }
-    elseif sw.boss then
+    elseif sw.boss and sw.id ~= "Tushita" then
         bossNames = { sw.boss }
     end
     if bossNames then
@@ -2620,51 +2842,7 @@ function SW.step(root, dt)
         end
 
     elseif sw.id == "Yama" then
-        local prog = SW.eliteProgress()
-        local ptxt = (prog and tostring(prog) or "?") .. "/30"
-        local eliteNames = { "Diablo", "Urban", "Deandre" }
-        local elite = findMobFromList(eliteNames, root, math.huge)
-        if isAlive(elite) then
-            SW.setMode(sw.id, "elite")
-            SW.fight(root, dt, elite, ("Yama (%s): Săn Elite %s"):format(ptxt, elite.Name), false)
-            return
-        end
-        if SW.flyToSpawned(root, dt, eliteNames, sw.id, ("Yama (%s): Elite đã spawn - đang bay tới"):format(ptxt)) then
-            return
-        end
-        local ghost = findMobByName("Ghost", root, 1500)
-        if isAlive(ghost) then
-            SW.setMode(sw.id, "ghost")
-            SW.fight(root, dt, ghost, "Yama: Dọn Ghost tại Đền Hydra", true)
-            return
-        end
-        if prog == nil or prog >= 30 then
-            SW.setMode(sw.id, "pull")
-            State.target = nil
-            State.statusText = "Yama: Đang rút kiếm tại Đền Hydra (" .. ptxt .. ")"
-            moveTowards(root, sw.pos, sw.pos, dt)
-            local map = workspace:FindFirstChild("Map")
-            local waterfall = map and map:FindFirstChild("Waterfall")
-            if waterfall then
-                for _, desc in ipairs(waterfall:GetDescendants()) do
-                    if desc:IsA("ClickDetector") then pcall(fireclickdetector, desc) end
-                end
-            end
-            if SW.idleFor() > 60 then
-                SW.warn("Yama", "Đã tới Đền Hydra nhưng chưa rút được kiếm. Hãy thử tự rút bằng tay.")
-            end
-            return
-        end
-        -- Chưa đủ 30 Elite: chờ Elite mới (remote EliteHunter đã chạy ở vòng lặp remote)
-        SW.setMode(sw.id, "elite_wait")
-        State.target = nil
-        State.statusText = ("Yama: chờ Elite spawn (%s)..."):format(ptxt)
-        moveTowards(root, sw.pos + Vector3.new(0, 12, 0), sw.pos, dt)
-        if SW.idleFor() > 60 then
-            SW.warn("Yama", "Elite chưa xuất hiện (" .. ptxt .. "). Thử đổi server hoặc chờ thêm.")
-        end
-        SW.maybeHop("Elite không spawn")
-        return
+        if SW.yama(root, dt, sw) then return end
 
     elseif sw.id == "Cursed Dual Katana" then
         local cdkMob = findMobFromList({ "Cursed Skeleton Boss", "Soul Reaper", "Forest Pirate" }, root, 1500)
@@ -3084,10 +3262,6 @@ task.spawn(function()
                         invokeCommF("ProQuestProgress", "FillCup")
                         invokeCommF("ProQuestProgress", "SickMan")
                         invokeCommF("ProQuestProgress", "RichSon")
-                    elseif sw.id == "Yama" then
-                        invokeCommF("EliteHunter")
-                    elseif sw.id == "Tushita" then
-                        invokeCommF("TushitaProgress", "Start")
                     elseif sw.id == "Cursed Dual Katana" then
                         invokeCommF("CDKQuest", "Progress", "Good")
                         invokeCommF("CDKQuest", "Progress", "Evil")
@@ -4089,7 +4263,9 @@ task.spawn(function()
                 nearTarget = d <= math.max(45, config.farmHeight + config.farmDist + 18)
             end
 
-            if config.autoFarmKen then
+            if State.holdUntil and os.clock() < State.holdUntil then
+                task.wait(0.2) -- đang thắp đuốc Tushita: không đổi tay cầm / không đánh
+            elseif config.autoFarmKen then
                 task.wait(0.3)
             elseif config.autoMastery and nearTarget and hasTarget then
                 local mHum = State.target:FindFirstChildOfClass("Humanoid")
